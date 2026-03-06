@@ -17,7 +17,7 @@ def forward_psf(c, Z_mat, pupil_mask, wavefront_delta,
     给定 Zernike 系数 c，计算归一化 PSF。
 
     参数:
-        c               : (nZ,) float tensor，requires_grad=True
+        c               : (nZ,) float tensor
         Z_mat           : (H,W,nZ) float tensor，Zernike 基底
         pupil_mask      : (H,W) float tensor，瞳函数掩模
         wavefront_delta : (H,W) float tensor，已知多样性像差（焦面传0）
@@ -37,34 +37,46 @@ def forward_psf(c, Z_mat, pupil_mask, wavefront_delta,
     # 菲涅尔传播
     Uout     = two_step_prop_torch(Uin, wvl, d1, d2, Dz, device)
     PSF      = torch.abs(Uout) ** 2
-    PSF_norm = PSF / (PSF.max() + 1e-30)
+    PSF_norm = PSF / (PSF.sum() + 1e-30)   #归一化
 
     return PSF_norm
 
 
 # ============================================================
-# 损失函数：基于 two_step_prop 的相位差代价函数
+# 损失函数：支持多张离焦图片
 # ============================================================
 
 def cost_pd(c, Z_mat, pupil_mask,
-            PSF_focus_t, PSF_de_t,
-            delta_focus, delta_de,
+            PSF_focus_t, PSF_de_list_t,
+            delta_focus, delta_de_list,
             wvl, d1, d2, Dz, device,
             gamma=1e-6, alpha=0.0):
     """
-    J(c) = ||PSF_pred_focus - PSF_focus||² + ||PSF_pred_de - PSF_de||²
-           + γ·||c||²
+    J(c) = ||PSF_pred_focus - PSF_focus||²
+         + Σ_k ||PSF_pred_de_k - PSF_de_k||²
+         + γ·||c||²
 
-    注：与 zernretrieve_loop 保持同样的正则化结构。
+    参数:
+        PSF_de_list_t  : list of (H,W) tensor，多张离焦 PSF
+        delta_de_list  : list of (H,W) tensor，对应的已知多样性像差波前
     """
+    # 焦面损失
     PSF_pred_focus = forward_psf(c, Z_mat, pupil_mask, delta_focus,
                                   wvl, d1, d2, Dz, device)
-    PSF_pred_de    = forward_psf(c, Z_mat, pupil_mask, delta_de,
-                                  wvl, d1, d2, Dz, device)
+    # 输入焦面PSF也做能量归一化，与预测保持一致
+    PSF_focus_norm = PSF_focus_t / (PSF_focus_t.sum() + 1e-30)
+    loss = torch.sum((PSF_pred_focus - PSF_focus_norm) ** 2)
 
-    loss = (torch.sum((PSF_pred_focus - PSF_focus_t) ** 2) +
-            torch.sum((PSF_pred_de    - PSF_de_t   ) ** 2))
+    # 每张离焦图的损失
+    for PSF_de_t, delta_de in zip(PSF_de_list_t, delta_de_list):
+        PSF_pred_de = forward_psf(c, Z_mat, pupil_mask, delta_de,
+                                   wvl, d1, d2, Dz, device)
+        PSF_de_norm = PSF_de_t / (PSF_de_t.sum() + 1e-30)
+        loss = loss + torch.sum((PSF_pred_de - PSF_de_norm) ** 2)
 
+    # 正则项
+    if gamma != 0.0:
+        loss = loss + gamma * torch.dot(c, c)
     if alpha != 0.0:
         loss = loss + alpha * torch.dot(c, c)
 
@@ -72,11 +84,12 @@ def cost_pd(c, Z_mat, pupil_mask,
 
 
 # ============================================================
-# 主优化函数
+# 主优化函数：支持多张离焦图片输入
 # ============================================================
 
-def phase_diversity_retrieve(PSF_focus, PSF_de, Z_UDA,
-                              defocus_coeff=None,
+def phase_diversity_retrieve(PSF_focus, PSF_de_list, Z_UDA,
+                              coff_div_list=None,
+                              c0=None,
                               wvl=2e-6, d1=None, d2=2e-6/1e-4,
                               Dz=132.812,
                               gamma=1e-6, alpha=0.0,
@@ -85,19 +98,22 @@ def phase_diversity_retrieve(PSF_focus, PSF_de, Z_UDA,
                               optimizer_type='Adam',
                               verbose=True):
     """
-    相位差波前复原——two_step_prop 前向模型 + PyTorch 自动微分。
+    相位差波前复原——支持多张离焦图片。
 
     参数:
         PSF_focus      : (H,W) numpy，焦面归一化 PSF
-        PSF_de         : (H,W) numpy，离焦归一化 PSF
-        Z_UDA          : list of (H,W) numpy，正交 Zernike 基底
-        defocus_coeff  : float，已知离焦 Zernike 系数（第4项系数）
+        PSF_de_list    : list of (H,W) numpy，多张离焦归一化 PSF
+                         （单张时也可传 list，如 [PSF_de]）
+        Z_UDA          : list of (H,W) numpy，正交 Zernike 基底（共 nZ 项）
+        coff_div_list  : list of (nZ,) numpy，每张离焦图对应的已知 Zernike 系数
+                         长度需与 PSF_de_list 一致
+        c0             : (nZ,) numpy，初始 Zernike 系数（默认全零）
         wvl            : 波长 (m)
-        d1             : 源平面采样间距 (m)，默认 6.605a/N
+        d1             : 源平面采样间距 (m)
         d2             : 像面采样间距 (m)
         Dz             : 传播距离 (m)
-        gamma          : L2 正则化强度
-        alpha          : Zernike 系数正则化强度
+        gamma          : Zernike 系数 L2 正则化强度
+        alpha          : 额外相位正则化强度（通常=0）
         lr             : 学习率
         max_iter       : 最大迭代次数
         tol            : 收敛阈值
@@ -109,40 +125,58 @@ def phase_diversity_retrieve(PSF_focus, PSF_de, Z_UDA,
         J_hist         : list，损失历史
         wavefront_est  : (H,W) numpy，重建波前
     """
+    # 单张输入兼容处理
+    if isinstance(PSF_de_list, np.ndarray):
+        PSF_de_list = [PSF_de_list]
+    if coff_div_list is not None and isinstance(coff_div_list, np.ndarray):
+        coff_div_list = [coff_div_list]
+
+    n_de = len(PSF_de_list)
+    assert coff_div_list is None or len(coff_div_list) == n_de, \
+        f"coff_div_list 长度({len(coff_div_list)}) 需与 PSF_de_list 长度({n_de}) 一致"
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    print(f"Using device: {device}，离焦图片数量: {n_de}")
 
     H, W = PSF_focus.shape
     nZ   = len(Z_UDA)
 
-    # 默认采样间距
     if d1 is None:
         a  = 1e-4
-        N0 = H
-        d1 = 6.605 * a / N0
+        d1 = 6.605 * a / H
 
-    def to_t(x, cplx=False):
-        dt = torch.complex64 if cplx else torch.float32
-        return torch.tensor(x, dtype=dt, device=device)
+    def to_t(x):
+        return torch.tensor(np.array(x).astype(np.float32),
+                            dtype=torch.float32, device=device)
 
     # ── 数据张量 ──────────────────────────────────────────────────────────
-    PSF_focus_t = to_t(PSF_focus.astype(np.float32))
-    PSF_de_t    = to_t(PSF_de.astype(np.float32))
-    Z_mat       = to_t(np.stack(Z_UDA, axis=-1))          # (H,W,nZ)
-    pupil_mask  = to_t((np.abs(Z_UDA[0]) > 0).astype(np.float32))
+    PSF_focus_t    = to_t(PSF_focus)
+    PSF_de_list_t  = [to_t(p) for p in PSF_de_list]
+    Z_mat          = to_t(np.stack(Z_UDA, axis=-1))          # (H,W,nZ)
+    pupil_mask     = to_t((np.abs(Z_UDA[0]) > 0).astype(np.float32))
 
-    # ── 已知多样性像差 ────────────────────────────────────────────────────
+    # ── 焦面多样性像差（零）──────────────────────────────────────────────
     delta_focus = torch.zeros(H, W, dtype=torch.float32, device=device)
 
-    if defocus_coeff is None:
-        defocus_coeff = 1.0
-        print("  defocus_coeff 未指定，使用默认值 1.0")
-    delta_de = to_t((plot_wavefront_from_zernike(Z_UDA,defocus_coeff)
-                     if nZ >= 4 else np.zeros((H, W))).astype(np.float32))
+    # ── 各离焦图对应的已知波前 delta_de ──────────────────────────────────
+    # 用 coff_div（完整 Zernike 系数组）重建离焦波前，而非单一系数
+    delta_de_list = []
+    for k in range(n_de):
+        if coff_div_list is not None:
+            # 用 plot_wavefront_from_zernike 重建完整离焦波前
+            wf_de = plot_wavefront_from_zernike(Z_UDA, coff_div_list[k])
+            delta_de_list.append(to_t(wf_de.astype(np.float32)))
+        else:
+            # 无已知像差时传零（退化为单纯相位差）
+            print(f"  警告：第{k}张离焦图未提供 coff_div，delta_de 设为0")
+            delta_de_list.append(torch.zeros(H, W, dtype=torch.float32, device=device))
 
     # ── 初始化参数 ────────────────────────────────────────────────────────
-    c = torch.zeros(nZ, dtype=torch.float32,
-                    device=device, requires_grad=True)
+    if c0 is not None:
+        c_init = torch.tensor(c0[:nZ].astype(np.float32), device=device)
+    else:
+        c_init = torch.zeros(nZ, dtype=torch.float32, device=device)
+    c = c_init.clone().detach().requires_grad_(True)
 
     # ── 优化器 ────────────────────────────────────────────────────────────
     if optimizer_type == 'LBFGS':
@@ -158,11 +192,11 @@ def phase_diversity_retrieve(PSF_focus, PSF_de, Z_UDA,
     def closure():
         optimizer.zero_grad()
         J = cost_pd(c, Z_mat, pupil_mask,
-                    PSF_focus_t, PSF_de_t,
-                    delta_focus, delta_de,
+                    PSF_focus_t, PSF_de_list_t,
+                    delta_focus, delta_de_list,
                     wvl, d1, d2, Dz, device,
                     gamma=gamma, alpha=alpha)
-        J.backward()          # ← 自动微分
+        J.backward()
         return J
 
     for i in range(max_iter):
@@ -202,68 +236,80 @@ def phase_diversity_retrieve(PSF_focus, PSF_de, Z_UDA,
 
 
 # ============================================================
-# 画图函数（前向模型也用 two_step_prop_torch）
+# 画图函数：支持多张离焦 PSF 对比
 # ============================================================
 
-def plot_phase_diversity_result(PSF_focus, PSF_de,
+def plot_phase_diversity_result(PSF_focus, PSF_de_list,
                                  wavefront_est, c_est,
                                  J_hist, Z_UDA,
+                                 coff_div_list=None,
                                  wvl=2e-6, d1=None, d2=2e-6/1e-4, Dz=132.812,
-                                 defocus_coeff=1.0,
                                  wavefront_true=None,
                                  c_true=None,
                                  save_path="image/phase_diversity_result.png"):
+
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    # 单张兼容
+    if isinstance(PSF_de_list, np.ndarray):
+        PSF_de_list = [PSF_de_list]
+    if coff_div_list is not None and isinstance(coff_div_list, np.ndarray):
+        coff_div_list = [coff_div_list]
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     H, W   = PSF_focus.shape
     nZ     = len(c_est)
+    n_de   = len(PSF_de_list)
 
     if d1 is None:
         a  = 1e-4
         d1 = 6.605 * a / H
 
-    # ── 用估计系数重建两张 PSF ────────────────────────────────────────────
-    Z_mat      = torch.tensor(np.stack(Z_UDA, axis=-1),
-                               dtype=torch.float32, device=device)
-    pupil_mask = torch.tensor((np.abs(Z_UDA[0]) > 0).astype(np.float32),
-                               device=device)
-    c_t        = torch.tensor(c_est, dtype=torch.float32, device=device)
+    def to_t(x):
+        return torch.tensor(np.array(x).astype(np.float32),
+                            dtype=torch.float32, device=device)
 
+    Z_mat      = to_t(np.stack(Z_UDA, axis=-1))
+    pupil_mask = to_t((np.abs(Z_UDA[0]) > 0).astype(np.float32))
+    c_t        = to_t(c_est)
+
+    # ── 重建焦面 PSF ──────────────────────────────────────────────────────
     delta_focus = torch.zeros(H, W, dtype=torch.float32, device=device)
-    delta_de    = torch.tensor(
-        (plot_wavefront_from_zernike(Z_UDA,defocus_coeff) if nZ >= 4 else np.zeros((H, W))).astype(np.float32),
-        device=device)
-
     with torch.no_grad():
         PSF_pred_focus = forward_psf(c_t, Z_mat, pupil_mask, delta_focus,
                                       wvl, d1, d2, Dz, device).cpu().numpy()
-        PSF_pred_de    = forward_psf(c_t, Z_mat, pupil_mask, delta_de,
-                                      wvl, d1, d2, Dz, device).cpu().numpy()
+        PSF_pred_focus=PSF_pred_focus/PSF_pred_focus.max()
 
-    # ── 差值 ──────────────────────────────────────────────────────────────
-    has_true_wf = wavefront_true is not None
-    has_true_c  = c_true is not None
-    if not has_true_wf: wavefront_true = np.zeros_like(wavefront_est)
-    if not has_true_c:  c_true = np.zeros(nZ)
+    # ── 重建各张离焦 PSF ──────────────────────────────────────────────────
+    PSF_pred_de_list = []
+    for k in range(n_de):
+        if coff_div_list is not None:
+            wf_de    = plot_wavefront_from_zernike(Z_UDA, coff_div_list[k])
+            delta_de = to_t(wf_de.astype(np.float32))
+        else:
+            delta_de = torch.zeros(H, W, dtype=torch.float32, device=device)
+        with torch.no_grad():
+            psf_pred = forward_psf(c_t, Z_mat, pupil_mask, delta_de,
+                                    wvl, d1, d2, Dz, device).cpu().numpy()
+            psf_pred=psf_pred/psf_pred.max()
+        PSF_pred_de_list.append(psf_pred)
 
+    # ── 波前 / 系数差值 ───────────────────────────────────────────────────
     pupil_np = (np.abs(Z_UDA[0]) > 0).astype(float)
-    wf_diff  = wavefront_true - wavefront_est
-    c_diff   = np.array(c_true)[:nZ] - c_est
-    psf_focus_diff = PSF_focus  - PSF_pred_focus
-    psf_de_diff    = PSF_de     - PSF_pred_de
+    if wavefront_true is None: wavefront_true = np.zeros_like(wavefront_est)
+    if c_true is None:         c_true = np.zeros(nZ)
 
-    # ── 色条统一范围 ──────────────────────────────────────────────────────
+    wf_diff = wavefront_true - wavefront_est
+    c_diff  = np.array(c_true)[:nZ] - c_est
     wf_abs  = max(np.abs(wavefront_true).max(), np.abs(wavefront_est).max()) + 1e-10
-    psf_max = max(PSF_focus.max(), PSF_pred_focus.max()) + 1e-10
 
     # ============================================================
-    # 图1：波前（3列）+ Zernike 系数（3列）
+    # 图1：波前 + Zernike 系数
     # ============================================================
     fig1, axes1 = plt.subplots(2, 3, figsize=(15, 9))
 
-    # 波前行
-    titles_wf = ["原始波前", "预测波前", f"差值（RMS={np.std(wf_diff[pupil_np>0]):.4f}）"]
+    titles_wf = ["原始波前", "预测波前",
+                 f"差值（RMS={np.std(wf_diff[pupil_np>0]):.4f}）"]
     datas_wf  = [wavefront_true, wavefront_est, wf_diff]
     vmaxs_wf  = [wf_abs, wf_abs, np.abs(wf_diff).max()+1e-10]
     for col, (title, data, vm) in enumerate(zip(titles_wf, datas_wf, vmaxs_wf)):
@@ -272,12 +318,11 @@ def plot_phase_diversity_result(PSF_focus, PSF_de,
         plt.colorbar(im, ax=axes1[0, col])
         axes1[0, col].set_title(title)
 
-    # Zernike 系数行
-    x_idx = np.arange(1, nZ + 1)
+    x_idx  = np.arange(1, nZ + 1)
     colors = ['steelblue', 'darkorange', 'firebrick']
     labels = ['原始 Zernike 系数', '预测 Zernike 系数',
               f'差值（RMS={np.std(c_diff):.4f}）']
-    datas_c = [c_true[:nZ], c_est, c_diff]
+    datas_c = [np.array(c_true)[:nZ], c_est, c_diff]
     for col, (label, data, color) in enumerate(zip(labels, datas_c, colors)):
         axes1[1, col].bar(x_idx, data, alpha=0.8, color=color)
         axes1[1, col].axhline(0, color='k', linewidth=0.5)
@@ -288,40 +333,46 @@ def plot_phase_diversity_result(PSF_focus, PSF_de,
     fig1.suptitle("波前与 Zernike 系数对比", fontsize=14, fontweight='bold')
     plt.tight_layout()
     path1 = save_path.replace(".png", "_wavefront.png")
-    plt.savefig(path1, dpi=150)
-    plt.show()
+    plt.savefig(path1, dpi=150); plt.show()
 
     # ============================================================
-    # 图2：焦面PSF（3列）+ 离焦PSF（3列）
+    # 图2：焦面PSF（1行）+ 各离焦PSF（每张1行），各3列（原始/预测/差值）
     # ============================================================
-    fig2, axes2 = plt.subplots(2, 3, figsize=(15, 9))
+    n_rows  = 1 + n_de
+    fig2, axes2 = plt.subplots(n_rows, 3, figsize=(15, 4 * n_rows))
+    if n_rows == 1:
+        axes2 = axes2[np.newaxis, :]   # 保证二维索引
 
-    rows = [
-        ("焦面 PSF",
-         PSF_focus, PSF_pred_focus, psf_focus_diff),
-        ("离焦 PSF",
-         PSF_de,    PSF_pred_de,    psf_de_diff),
-    ]
-    for row_idx, (row_title, orig, pred, diff) in enumerate(rows):
-        diff_vm = np.abs(diff).max() + 1e-10
+    psf_max = max(PSF_focus.max(), PSF_pred_focus.max()) + 1e-10
+
+    def _plot_psf_row(ax_row, orig, pred, row_title, psf_vmax):
+        diff     = orig - pred
+        diff_vm  = np.abs(diff).max() + 1e-10
         for col_idx, (data, title, vm, cmap) in enumerate([
-            (orig, f"{row_title}（原始）",  psf_max,  'hot'),
-            (pred, f"{row_title}（预测）",  psf_max,  'hot'),
-            (diff, f"{row_title}（差值）",  diff_vm,  'RdBu_r'),
+            (orig, f"{row_title}（原始）", psf_vmax, 'hot'),
+            (pred, f"{row_title}（预测）", psf_vmax, 'hot'),
+            (diff, f"{row_title}（差值）", diff_vm,  'RdBu_r'),
         ]):
             vmin = 0 if cmap == 'hot' else -vm
-            im = axes2[row_idx, col_idx].imshow(data, origin='lower',
-                                                 cmap=cmap, vmin=vmin, vmax=vm,
-                                                 aspect='auto')
-            plt.colorbar(im, ax=axes2[row_idx, col_idx])
-            axes2[row_idx, col_idx].set_title(title)
+            im = ax_row[col_idx].imshow(data, origin='lower', cmap=cmap,
+                                         vmin=vmin, vmax=vm, aspect='auto')
+            plt.colorbar(im, ax=ax_row[col_idx])
+            ax_row[col_idx].set_title(title)
+
+    # 焦面行
+    _plot_psf_row(axes2[0], PSF_focus, PSF_pred_focus, "焦面 PSF", psf_max)
+
+    # 各离焦行
+    for k in range(n_de):
+        psf_vmax_k = max(PSF_de_list[k].max(), PSF_pred_de_list[k].max()) + 1e-10
+        _plot_psf_row(axes2[k+1], PSF_de_list[k], PSF_pred_de_list[k],
+                      f"离焦 PSF #{k+1}", psf_vmax_k)
 
     fig2.suptitle("PSF 对比（two_step_prop 前向模型）",
                   fontsize=14, fontweight='bold')
     plt.tight_layout()
     path2 = save_path.replace(".png", "_PSF.png")
-    plt.savefig(path2, dpi=150)
-    plt.show()
+    plt.savefig(path2, dpi=150); plt.show()
 
     # ============================================================
     # 图3：损失曲线 + 统计
@@ -333,7 +384,9 @@ def plot_phase_diversity_result(PSF_focus, PSF_de,
     axes3[0].set_title("损失函数收敛曲线"); axes3[0].grid(True, alpha=0.3)
 
     axes3[1].axis('off')
-    info = (f"波前 RMS（原始）  : {np.std(wavefront_true[pupil_np>0]):.4f}\n"
+    info = (f"离焦图片数量      : {n_de}\n"
+            f"Zernike 项数      : {nZ}\n\n"
+            f"波前 RMS（原始）  : {np.std(wavefront_true[pupil_np>0]):.4f}\n"
             f"波前 RMS（预测）  : {np.std(wavefront_est[pupil_np>0]):.4f}\n"
             f"波前 RMS（差值）  : {np.std(wf_diff[pupil_np>0]):.4f}\n\n"
             f"Zernike RMS（差值）: {np.std(c_diff):.4f}\n"
@@ -346,7 +399,6 @@ def plot_phase_diversity_result(PSF_focus, PSF_de,
 
     plt.tight_layout()
     path3 = save_path.replace(".png", "_loss.png")
-    plt.savefig(path3, dpi=150)
-    plt.show()
+    plt.savefig(path3, dpi=150); plt.show()
 
     print(f"结果已保存:\n  {path1}\n  {path2}\n  {path3}")

@@ -1,6 +1,8 @@
 import clr, os, winreg
 import numpy as np
 import matplotlib
+from sympy.physics.units import length
+
 matplotlib.use('TkAgg')  # 在 import pyplot 之前设置
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
@@ -224,36 +226,58 @@ PSF_matrix_zemax = PSF_matrix_zemax.reshape(psf_ny, psf_nx)  # ✅ reshape
 PSF_matrix_focus = np.flip(np.flip(PSF_matrix_zemax, axis=0), axis=1)
 PSF_matrix_focus_norm=PSF_matrix_focus/PSF_matrix_focus.max()
 # ============================================================
-# 9. 引入离焦量（修改第12行厚度）
+# 构建zernike基底
+# ============================================================
+wavefront_attitude = (wavefront_matrix_focus != 0).astype(float)
+[UDA1,bound]=extract_square_region(wavefront_matrix_focus,wavefront_attitude)
+mask=(UDA1!=0)
+# 计算正交Zernike多项式
+mat_path=r"C:\Users\25313\Documents\Zemax\ZOS-API Projects\MATLABStandaloneApplication7\Zernikefringe.mat"
+Z_UDA_temp= gram_schmidt_mask(37,1,bound['square_size'],1,0,0,mask,mat_path)
+Z_UDA=Z_UDA_in_mask(wavefront_matrix_focus,mask,wavefront_attitude,bound,37,Z_UDA_temp)
+[F0,mse0] = zernike_fit(wavefront_matrix_focus, Z_UDA)
+# ============================================================
+# 保存原始厚度
 # ============================================================
 LDESurface = TheSystem.LDE      # 镜头数据编辑器
 scGroup = LDESurface.GetRowAt(6)
 temp_focus = scGroup.Thickness   # 保存原始厚度
-scGroup.Thickness = -0.02         # 设置离焦量 10mm
 # ============================================================
-# 10. 获取离焦后波前图
+# 引入离焦量
 # ============================================================
-wavefront_analysis.ApplyAndWaitForCompletion()
-wavefront_results = wavefront_analysis.GetResults()
-wavefront_data = wavefront_results.GetDataGrid(0)
-wavefront_matrix_de = np.array(list(wavefront_data.Values), dtype=float)
-wavefront_matrix_de = np.nan_to_num(wavefront_matrix_de, nan=0.0)
-wavefront_matrix_de = wavefront_matrix_de.reshape(ny, nx)  # ✅ reshape
-# 计算波前差
-wavefront_matrix_deta = wavefront_matrix_de - wavefront_matrix_focus
-# ============================================================
-# 11. 获取离焦后 PSF
-# ============================================================
-PSF_analysis.ApplyAndWaitForCompletion()
-PSF_results = PSF_analysis.GetResults()
-PSF_data = PSF_results.GetDataGrid(0)
-psf_nx, psf_ny = PSF_data.Nx, PSF_data.Ny  # PSF 尺寸可能不同（512x512）
-PSF_matrix_zemax = np.array(list(PSF_data.Values), dtype=float)
-PSF_matrix_zemax = PSF_matrix_zemax.reshape(psf_ny, psf_nx)  # ✅ reshape
-# 对应 MATLAB: flip(flip(PSF_matrix_zemax, 1), 2)
-# MATLAB axis 1 = 行(上下翻转), axis 2 = 列(左右翻转)
-PSF_matrix_de = np.flip(np.flip(PSF_matrix_zemax, axis=0), axis=1)
-PSF_matrix_de_norm=PSF_matrix_de /PSF_matrix_de.max()
+defocus_steps =[-2,-1,1,2]
+# 存储多组结果
+coff_div_list      = []   # 每个离焦量对应的 Zernike 系数
+PSF_de_norm_list   = []   # 每个离焦量对应的归一化 PSF
+for step in defocus_steps:
+    scGroup.Thickness = step*0.02
+    # ============================================================
+    # 10. 获取离焦后波前图
+    # ============================================================
+    wavefront_analysis.ApplyAndWaitForCompletion()
+    wavefront_results = wavefront_analysis.GetResults()
+    wavefront_data = wavefront_results.GetDataGrid(0)
+    wavefront_matrix_de = np.array(list(wavefront_data.Values), dtype=float)
+    wavefront_matrix_de = np.nan_to_num(wavefront_matrix_de, nan=0.0)
+    wavefront_matrix_de = wavefront_matrix_de.reshape(ny, nx)  # ✅ reshape
+    # 计算波前差
+    wavefront_matrix_deta = wavefront_matrix_de - wavefront_matrix_focus
+    coff_div, mse1 = zernike_fit(wavefront_matrix_deta, Z_UDA)
+    coff_div_list.append(coff_div)
+    # ============================================================
+    # 11. 获取离焦后 PSF
+    # ============================================================
+    PSF_analysis.ApplyAndWaitForCompletion()
+    PSF_results = PSF_analysis.GetResults()
+    PSF_data = PSF_results.GetDataGrid(0)
+    psf_nx, psf_ny = PSF_data.Nx, PSF_data.Ny  # PSF 尺寸可能不同（512x512）
+    PSF_matrix_zemax = np.array(list(PSF_data.Values), dtype=float)
+    PSF_matrix_zemax = PSF_matrix_zemax.reshape(psf_ny, psf_nx)  # ✅ reshape
+    # 对应 MATLAB: flip(flip(PSF_matrix_zemax, 1), 2)
+    # MATLAB axis 1 = 行(上下翻转), axis 2 = 列(左右翻转)
+    PSF_matrix_de = np.flip(np.flip(PSF_matrix_zemax, axis=0), axis=1)
+    PSF_matrix_de_norm=PSF_matrix_de /PSF_matrix_de.max()
+    PSF_de_norm_list.append(PSF_matrix_de_norm)
 # ============================================================
 # 13. 恢复原始厚度
 # ============================================================
@@ -317,27 +341,16 @@ print(f"已恢复原始厚度: {temp_focus} mm")
 # plt.tight_layout()
 # plt.savefig("image/psf_zemax_and_python.png", dpi=150)
 # plt.show()
-
-# ============================================================
-# 构建zernike基底
-# ============================================================
-wavefront_attitude = (wavefront_matrix_focus != 0).astype(float)
-[UDA1,bound]=extract_square_region(wavefront_matrix_focus,wavefront_attitude)
-mask=(UDA1!=0)
-# 计算正交Zernike多项式
-mat_path=r"C:\Users\25313\Documents\Zemax\ZOS-API Projects\MATLABStandaloneApplication7\Zernikefringe.mat"
-Z_UDA_temp= gram_schmidt_mask(37,1,bound['square_size'],1,0,0,mask,mat_path)
-Z_UDA=Z_UDA_in_mask(wavefront_matrix_focus,mask,wavefront_attitude,bound,37,Z_UDA_temp)
-[F0,mse0] = zernike_fit(wavefront_matrix_focus, Z_UDA)
-[coff_div,mse1]=zernike_fit(wavefront_matrix_deta, Z_UDA)
 # ============================================================
 # 相位差算法调用
 # ============================================================
+Z_UDA_10=Z_UDA[:10]
+coff_div_list_10 = [c[:10] for c in coff_div_list]
 c_est, J_hist, wavefront_est = phase_diversity_retrieve(
     PSF_matrix_focus_norm,
-    PSF_matrix_de_norm,
-    Z_UDA,
-    defocus_coeff = coff_div,        # 已知离焦量
+    PSF_de_norm_list,
+    Z_UDA_10,
+    coff_div_list = coff_div_list_10,        # 已知离焦量
     wvl=wvl, d1=d1,
     d2=d2, Dz=Dz,
     lr=0.001, max_iter=10000,
@@ -345,13 +358,14 @@ c_est, J_hist, wavefront_est = phase_diversity_retrieve(
 )
 
 plot_phase_diversity_result(
-    PSF_matrix_focus_norm, PSF_matrix_de_norm,
-    wavefront_est, c_est, J_hist, Z_UDA,
+    PSF_matrix_focus_norm, PSF_de_norm_list,
+    wavefront_est, c_est, J_hist, Z_UDA_10,
+    coff_div_list = coff_div_list_10,
     wvl=wvl, d1=d1,
     d2=d2, Dz=Dz,
-    defocus_coeff = coff_div,
     wavefront_true = wavefront_matrix_focus,
-    c_true = F0,
+    c_true = F0[:10],
+    save_path="image_test3/phase_diversity_result.png"
 )
 
 
