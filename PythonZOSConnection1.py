@@ -1,8 +1,6 @@
 import clr, os, winreg
 import numpy as np
 import matplotlib
-from sympy.physics.units import length
-
 matplotlib.use('TkAgg')  # 在 import pyplot 之前设置
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
@@ -16,7 +14,8 @@ from fresnel_utils import (
     )
 from PD_func import(
     phase_diversity_retrieve,
-    plot_phase_diversity_result
+    plot_phase_diversity_result,
+    sensitivity_scan
 )
 # This boilerplate requires the 'pythonnet' module.
 # The following instructions are for installing the 'pythonnet' module via pip:
@@ -341,11 +340,25 @@ print(f"已恢复原始厚度: {temp_focus} mm")
 # plt.tight_layout()
 # plt.savefig("image/psf_zemax_and_python.png", dpi=150)
 # plt.show()
+Z_UDA_10=Z_UDA[:10]
+coff_div_list_10 = [c[:10] for c in coff_div_list]
+# ============================================================
+# 灵敏度扫描，确保F0的系数（真值）对于损失函数而言是最小值
+# ============================================================
+J_curves, scan_vals = sensitivity_scan(
+    PSF_matrix_focus_norm,
+    PSF_de_norm_list,
+    Z_UDA_10,
+    coff_div_list=coff_div_list_10,
+    F0=F0[:10],
+    wvl=wvl, d1=d1,
+    d2=d2, Dz=Dz,
+    scan_range=1,    # 每个系数扰动范围 ±0.5
+    scan_steps=41      # 扫描点数
+)
 # ============================================================
 # 相位差算法调用
 # ============================================================
-Z_UDA_10=Z_UDA[:10]
-coff_div_list_10 = [c[:10] for c in coff_div_list]
 c_est, J_hist, wavefront_est = phase_diversity_retrieve(
     PSF_matrix_focus_norm,
     PSF_de_norm_list,

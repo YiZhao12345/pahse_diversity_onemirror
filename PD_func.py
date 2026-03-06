@@ -402,3 +402,108 @@ def plot_phase_diversity_result(PSF_focus, PSF_de_list,
     plt.savefig(path3, dpi=150); plt.show()
 
     print(f"结果已保存:\n  {path1}\n  {path2}\n  {path3}")
+
+def sensitivity_scan(PSF_focus, PSF_de_list, Z_UDA,
+                     coff_div_list, F0,
+                     wvl=2e-6, d1=None, d2=2e-6 / 1e-4, Dz=132.812,
+                     gamma=1e-6, alpha=0.0,
+                     scan_range=0.5, scan_steps=21):
+    """
+    对每个 Zernike 系数单独扫描损失函数，判断 F0 是否在最小值附近。
+
+    参数:
+        F0          : (nZ,) 基准 Zernike 系数（待验证的点）
+        scan_range  : 每个系数的扫描范围 ± scan_range
+        scan_steps  : 每个系数的扫描点数
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    H, W = PSF_focus.shape
+    nZ = len(F0)
+
+    if d1 is None:
+        a = 1e-4
+        d1 = 6.605 * a / H
+
+    def to_t(x):
+        return torch.tensor(np.array(x).astype(np.float32),
+                            dtype=torch.float32, device=device)
+
+    # 预先准备张量
+    PSF_focus_t = to_t(PSF_focus)
+    PSF_de_list_t = [to_t(p) for p in PSF_de_list]
+    Z_mat = to_t(np.stack(Z_UDA, axis=-1))
+    pupil_mask = to_t((np.abs(Z_UDA[0]) > 0).astype(np.float32))
+    delta_focus = torch.zeros(H, W, dtype=torch.float32, device=device)
+
+    delta_de_list = []
+    for coff in coff_div_list:
+        wf_de = plot_wavefront_from_zernike(Z_UDA, coff)
+        delta_de_list.append(to_t(wf_de.astype(np.float32)))
+
+    # 扫描轴
+    scan_vals = np.linspace(-scan_range, scan_range, scan_steps)
+
+    # 计算 F0 处的基准损失
+    with torch.no_grad():
+        c_base = to_t(F0)
+        J_base = cost_pd(c_base, Z_mat, pupil_mask,
+                         PSF_focus_t, PSF_de_list_t,
+                         delta_focus, delta_de_list,
+                         wvl, d1, d2, Dz, device,
+                         gamma=gamma, alpha=alpha).item()
+    print(f"F0 处基准损失 J = {J_base:.6e}")
+
+    # ── 逐项扫描 ──────────────────────────────────────────────────────────
+    J_curves = np.zeros((nZ, scan_steps))
+
+    for j in range(nZ):
+        for k, dv in enumerate(scan_vals):
+            c_scan = F0.copy()
+            c_scan[j] += dv  # 只扰动第 j 项
+            with torch.no_grad():
+                c_t = to_t(c_scan)
+                J_curves[j, k] = cost_pd(
+                    c_t, Z_mat, pupil_mask,
+                    PSF_focus_t, PSF_de_list_t,
+                    delta_focus, delta_de_list,
+                    wvl, d1, d2, Dz, device,
+                    gamma=gamma, alpha=alpha
+                ).item()
+
+        min_idx = np.argmin(J_curves[j])
+        print(f"  Z{j + 1:02d}: 最小值在偏移 {scan_vals[min_idx]:+.3f}，"
+              f"J_min={J_curves[j, min_idx]:.4e}，"
+              f"J_base={J_curves[j, scan_steps // 2]:.4e}")
+
+    # ── 画图 ──────────────────────────────────────────────────────────────
+    cols = 5
+    rows = int(np.ceil(nZ / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3.5, rows * 3))
+    axes = axes.flatten()
+
+    for j in range(nZ):
+        ax = axes[j]
+        ax.plot(scan_vals, J_curves[j], 'b-', linewidth=1.5)
+        ax.axvline(0, color='r', linestyle='--', linewidth=1, label='F0')
+        ax.axvline(scan_vals[np.argmin(J_curves[j])],
+                   color='g', linestyle=':', linewidth=1.5, label='J_min')
+        ax.set_title(f"Z{j + 1}")
+        ax.set_xlabel("Δc")
+        ax.set_ylabel("J")
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    # 隐藏多余子图
+    for j in range(nZ, len(axes)):
+        axes[j].set_visible(False)
+
+    fig.suptitle("灵敏度扫描：各 Zernike 系数对损失函数的影响\n"
+                 "红线=F0位置，绿线=最小值位置", fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    os.makedirs("image", exist_ok=True)
+    plt.savefig("image_test3/sensitivity_scan.png", dpi=150)
+    plt.show()
+    print("灵敏度扫描图已保存: image_test3/sensitivity_scan.png")
+
+    return J_curves, scan_vals
