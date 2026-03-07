@@ -1,4 +1,5 @@
 import clr, os, winreg
+import torch
 import numpy as np
 import matplotlib
 matplotlib.use('TkAgg')  # 在 import pyplot 之前设置
@@ -10,12 +11,15 @@ from fresnel_utils import (
     Z_UDA_in_mask,
     two_step_prop,
     extract_square_region,
-    gram_schmidt_mask
+    gram_schmidt_mask,
+    plot_wavefront_from_zernike
     )
 from PD_func import(
     phase_diversity_retrieve,
     plot_phase_diversity_result,
-    sensitivity_scan
+    sensitivity_scan,
+    compute_hessian,
+    cost_pd_image
 )
 # This boilerplate requires the 'pythonnet' module.
 # The following instructions are for installing the 'pythonnet' module via pip:
@@ -343,8 +347,53 @@ print(f"已恢复原始厚度: {temp_focus} mm")
 Z_UDA_10=Z_UDA[:10]
 coff_div_list_10 = [c[:10] for c in coff_div_list]
 # ============================================================
-# 灵敏度扫描，确保F0的系数（真值）对于损失函数而言是最小值
+# 统一准备所有中间变量（在调用优化和诊断函数之前运行一次）
 # ============================================================
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+image_focus=PSF_matrix_focus_norm
+image_de_norm_list=PSF_de_norm_list
+H, W = image_focus.shape
+nZ   = len(Z_UDA_10)
+gamma = 1e-6
+
+def to_t(x):
+    return torch.tensor(np.array(x).astype(np.float32),
+                        dtype=torch.float32, device=device)
+
+# Zernike 基底 / 瞳函数
+Z_mat      = to_t(np.stack(Z_UDA_10, axis=-1))
+pupil_mask = to_t((np.abs(Z_UDA_10[0]) > 0).astype(np.float32))
+
+# 图像 → FFT → imgDs (H,W,K)
+I_focus   = torch.fft.fft2(to_t(image_focus)).to(torch.complex64)
+I_de_list = [torch.fft.fft2(to_t(im)).to(torch.complex64)
+             for im in image_de_norm_list]
+imgDs     = torch.stack([I_focus] + I_de_list, dim=2)
+
+# 多样性像差 → wavefront_deltas (H,W,K)
+delta_focus = torch.zeros(H, W, dtype=torch.float32, device=device)
+delta_de_list = [to_t(plot_wavefront_from_zernike(Z_UDA_10, coff).astype(np.float32))
+                 for coff in coff_div_list_10]
+wavefront_deltas = torch.stack([delta_focus] + delta_de_list, dim=2)
+
+# ============================================================
+# 包装损失函数为纯 numpy 接口
+# ============================================================
+def cost_np(c_np):
+    with torch.no_grad():
+        c_t = torch.tensor(c_np.astype(np.float32), device=device)
+        return cost_pd_image(c_t, Z_mat, pupil_mask,
+                             imgDs, wavefront_deltas,
+                             wvl, d1, d2, Dz, device,
+                             gamma=gamma).item()
+
+# ============================================================
+# 调用诊断函数
+# ============================================================
+# Hessian 耦合分析
+H_mat, corr = compute_hessian(cost_np, F0[:10], eps=1e-3)
+# 灵敏度扫描，确保F0的系数（真值）对于损失函数而言是最小值
 J_curves, scan_vals = sensitivity_scan(
     PSF_matrix_focus_norm,
     PSF_de_norm_list,
@@ -353,7 +402,7 @@ J_curves, scan_vals = sensitivity_scan(
     F0=F0[:10],
     wvl=wvl, d1=d1,
     d2=d2, Dz=Dz,
-    scan_range=1,    # 每个系数扰动范围 ±0.5
+    scan_range=0.5,    # 每个系数扰动范围 ±0.5
     scan_steps=41      # 扫描点数
 )
 # ============================================================
