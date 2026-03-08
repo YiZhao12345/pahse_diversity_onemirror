@@ -11,7 +11,7 @@ from fresnel_utils import (
 # 前向模型：波前系数 → PSF（通过 two_step_prop_torch）
 # ============================================================
 
-def forward_psf(c, Z_mat, pupil_mask, wavefront_delta,
+def forward_otf(c, Z_mat, pupil_mask, wavefront_delta,
                 wvl, d1, d2, Dz, device):
     """
     给定 Zernike 系数 c，计算归一化 PSF。
@@ -38,56 +38,59 @@ def forward_psf(c, Z_mat, pupil_mask, wavefront_delta,
     Uout     = two_step_prop_torch(Uin, wvl, d1, d2, Dz, device)
     PSF      = torch.abs(Uout) ** 2
     PSF_norm = PSF / (PSF.sum() + 1e-30)   #归一化
-
-    return PSF_norm
+    OTF = torch.fft.fft2(PSF)  # 新增：PSF → OTF
+    return OTF
 
 
 # ============================================================
-# 损失函数：支持多张离焦图片
+# 损失函数：支持多张离焦图片,不在仅限于PSF图像
 # ============================================================
 
-def cost_pd(c, Z_mat, pupil_mask,
-            PSF_focus_t, PSF_de_list_t,
-            delta_focus, delta_de_list,
-            wvl, d1, d2, Dz, device,
-            gamma=1e-6, alpha=0.0):
+def cost_pd_image(c, Z_mat, pupil_mask,
+                  imgDs,                      # (H,W,K) 观测图像的FFT
+                  wavefront_deltas,           # (H,W,K) 已知多样性像差
+                  wvl, d1, d2, Dz, device,
+                  gamma=1e-6, alpha=0.0, Rc=None):
     """
-    J(c) = ||PSF_pred_focus - PSF_focus||²
-         + Σ_k ||PSF_pred_de_k - PSF_de_k||²
-         + γ·||c||²
+    基于 zernretrieve_loop 的损失函数，适用于任意场景图像输入。
 
-    参数:
-        PSF_de_list_t  : list of (H,W) tensor，多张离焦 PSF
-        delta_de_list  : list of (H,W) tensor，对应的已知多样性像差波前
+    J(c) = Σ_u [ Σ_k|Dk|² - |Σ_k Dk*·Sk|² / Q ] + α·cᵀRc·c
+    Q(u) = Σ_k|Sk|² + γ
+
+    imgDs  : (H,W,K) complex，K张观测图像的傅里叶变换
+             输入为实际拍摄图像时：imgDs[:,:,k] = fft2(image_k)
     """
-    # 焦面损失
-    PSF_pred_focus = forward_psf(c, Z_mat, pupil_mask, delta_focus,
-                                  wvl, d1, d2, Dz, device)
-    # 输入焦面PSF也做能量归一化，与预测保持一致
-    PSF_focus_norm = PSF_focus_t / (PSF_focus_t.sum() + 1e-30)
-    loss = torch.sum((PSF_pred_focus - PSF_focus_norm) ** 2)
+    K = imgDs.shape[2]
 
-    # 每张离焦图的损失
-    for PSF_de_t, delta_de in zip(PSF_de_list_t, delta_de_list):
-        PSF_pred_de = forward_psf(c, Z_mat, pupil_mask, delta_de,
-                                   wvl, d1, d2, Dz, device)
-        PSF_de_norm = PSF_de_t / (PSF_de_t.sum() + 1e-30)
-        loss = loss + torch.sum((PSF_pred_de - PSF_de_norm) ** 2)
+    # 计算每张图对应的 OTF
+    Sks = torch.stack([
+        forward_otf(c, Z_mat, pupil_mask,
+                    wavefront_deltas[:, :, k],
+                    wvl, d1, d2, Dz, device)
+        for k in range(K)
+    ], dim=2)                                 # (H,W,K)
 
-    # 正则项
-    if gamma != 0.0:
-        loss = loss + gamma * torch.dot(c, c)
-    if alpha != 0.0:
-        loss = loss + alpha * torch.dot(c, c)
+    # Q = Σ_k|Sk|² + γ
+    Q = torch.sum(torch.abs(Sks) ** 2, dim=2) + gamma   # (H,W)
 
-    return loss
+    # 分子：Σ_k Dk* · Sk
+    numer = torch.sum(torch.conj(imgDs) * Sks, dim=2)   # (H,W)
 
+    # 图像项
+    imgDs_sq = torch.sum(torch.abs(imgDs) ** 2, dim=2)  # (H,W)
+    J = torch.sum(imgDs_sq - torch.abs(numer) ** 2 / Q).real
+
+    # 相位正则项
+    if alpha != 0.0 and Rc is not None:
+        J = J + alpha * (c @ Rc @ c)
+
+    return J
 
 # ============================================================
 # 主优化函数：支持多张离焦图片输入
 # ============================================================
 
-def phase_diversity_retrieve(PSF_focus, PSF_de_list, Z_UDA,
+def phase_diversity_retrieve(image_focus, image_de_list, Z_UDA,
                               coff_div_list=None,
                               c0=None,
                               wvl=2e-6, d1=None, d2=2e-6/1e-4,
@@ -126,19 +129,19 @@ def phase_diversity_retrieve(PSF_focus, PSF_de_list, Z_UDA,
         wavefront_est  : (H,W) numpy，重建波前
     """
     # 单张输入兼容处理
-    if isinstance(PSF_de_list, np.ndarray):
-        PSF_de_list = [PSF_de_list]
+    if isinstance(image_de_list, np.ndarray):
+        image_de_list = [image_de_list]
     if coff_div_list is not None and isinstance(coff_div_list, np.ndarray):
         coff_div_list = [coff_div_list]
 
-    n_de = len(PSF_de_list)
+    n_de = len(image_de_list)
     assert coff_div_list is None or len(coff_div_list) == n_de, \
         f"coff_div_list 长度({len(coff_div_list)}) 需与 PSF_de_list 长度({n_de}) 一致"
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}，离焦图片数量: {n_de}")
 
-    H, W = PSF_focus.shape
+    H, W = image_focus.shape
     nZ   = len(Z_UDA)
 
     if d1 is None:
@@ -149,27 +152,36 @@ def phase_diversity_retrieve(PSF_focus, PSF_de_list, Z_UDA,
         return torch.tensor(np.array(x).astype(np.float32),
                             dtype=torch.float32, device=device)
 
-    # ── 数据张量 ──────────────────────────────────────────────────────────
-    PSF_focus_t    = to_t(PSF_focus)
-    PSF_de_list_t  = [to_t(p) for p in PSF_de_list]
-    Z_mat          = to_t(np.stack(Z_UDA, axis=-1))          # (H,W,nZ)
-    pupil_mask     = to_t((np.abs(Z_UDA[0]) > 0).astype(np.float32))
+    # ── 图像 → 频域（关键：用实际图像替代PSF）────────────────────────────
+    def img_to_fft(img):
+        t = to_t(img)
+        return torch.fft.fft2(t).to(torch.complex64)
+
+    I_focus = img_to_fft(image_focus)
+    I_de_list = [img_to_fft(im) for im in image_de_list]
+
+    # imgDs : (H,W,K)，K = 1(焦面) + n_de(离焦)
+    imgDs = torch.stack([I_focus] + I_de_list, dim=2)  # (H,W,1+n_de)
+
+    # ── Zernike 基底 / 瞳函数 ────────────────────────────────────────────
+    Z_mat = to_t(np.stack(Z_UDA, axis=-1))
+    pupil_mask = to_t((np.abs(Z_UDA[0]) > 0).astype(np.float32))
 
     # ── 焦面多样性像差（零）──────────────────────────────────────────────
     delta_focus = torch.zeros(H, W, dtype=torch.float32, device=device)
 
-    # ── 各离焦图对应的已知波前 delta_de ──────────────────────────────────
-    # 用 coff_div（完整 Zernike 系数组）重建离焦波前，而非单一系数
-    delta_de_list = []
+    # ── 多样性像差 wavefront_deltas (H,W,K) ──────────────────────────────
+    delta_focus = torch.zeros(H, W, dtype=torch.float32, device=device)
+    delta_list = [delta_focus]  # 第0张：焦面，delta=0
+
     for k in range(n_de):
         if coff_div_list is not None:
-            # 用 plot_wavefront_from_zernike 重建完整离焦波前
             wf_de = plot_wavefront_from_zernike(Z_UDA, coff_div_list[k])
-            delta_de_list.append(to_t(wf_de.astype(np.float32)))
+            delta_list.append(to_t(wf_de.astype(np.float32)))
         else:
-            # 无已知像差时传零（退化为单纯相位差）
-            print(f"  警告：第{k}张离焦图未提供 coff_div，delta_de 设为0")
-            delta_de_list.append(torch.zeros(H, W, dtype=torch.float32, device=device))
+            delta_list.append(torch.zeros(H, W, dtype=torch.float32, device=device))
+
+    wavefront_deltas = torch.stack(delta_list, dim=2)  # (H,W,K)
 
     # ── 初始化参数 ────────────────────────────────────────────────────────
     if c0 is not None:
@@ -191,11 +203,10 @@ def phase_diversity_retrieve(PSF_focus, PSF_de_list, Z_UDA,
 
     def closure():
         optimizer.zero_grad()
-        J = cost_pd(c, Z_mat, pupil_mask,
-                    PSF_focus_t, PSF_de_list_t,
-                    delta_focus, delta_de_list,
-                    wvl, d1, d2, Dz, device,
-                    gamma=gamma, alpha=alpha)
+        J = cost_pd_image(c, Z_mat, pupil_mask,
+                          imgDs, wavefront_deltas,
+                          wvl, d1, d2, Dz, device,
+                          gamma=gamma, alpha=alpha)
         J.backward()
         return J
 
@@ -276,8 +287,9 @@ def plot_phase_diversity_result(PSF_focus, PSF_de_list,
     # ── 重建焦面 PSF ──────────────────────────────────────────────────────
     delta_focus = torch.zeros(H, W, dtype=torch.float32, device=device)
     with torch.no_grad():
-        PSF_pred_focus = forward_psf(c_t, Z_mat, pupil_mask, delta_focus,
+        OTF_pred_focus = forward_otf(c_t, Z_mat, pupil_mask, delta_focus,
                                       wvl, d1, d2, Dz, device).cpu().numpy()
+        PSF_pred_focus = torch.abs(torch.fft.ifft2(OTF_pred_focus)).cpu().numpy()
         PSF_pred_focus=PSF_pred_focus/PSF_pred_focus.max()
 
     # ── 重建各张离焦 PSF ──────────────────────────────────────────────────
@@ -289,10 +301,11 @@ def plot_phase_diversity_result(PSF_focus, PSF_de_list,
         else:
             delta_de = torch.zeros(H, W, dtype=torch.float32, device=device)
         with torch.no_grad():
-            psf_pred = forward_psf(c_t, Z_mat, pupil_mask, delta_de,
+            OTF_pred_de = forward_otf(c_t, Z_mat, pupil_mask, delta_de,
                                     wvl, d1, d2, Dz, device).cpu().numpy()
-            psf_pred=psf_pred/psf_pred.max()
-        PSF_pred_de_list.append(psf_pred)
+            PSF_pred_de = torch.abs(torch.fft.ifft2(OTF_pred_de)).cpu().numpy()
+            psf_pred_de=psf_pred_de/psf_pred_de.max()
+        PSF_pred_de_list.append(psf_pred_de)
 
     # ── 波前 / 系数差值 ───────────────────────────────────────────────────
     pupil_np = (np.abs(Z_UDA[0]) > 0).astype(float)
@@ -403,7 +416,76 @@ def plot_phase_diversity_result(PSF_focus, PSF_de_list,
 
     print(f"结果已保存:\n  {path1}\n  {path2}\n  {path3}")
 
-def sensitivity_scan(PSF_focus, PSF_de_list, Z_UDA,
+
+def compute_hessian(cost_func, c_base, eps=1e-3):
+    """
+    数值计算 Hessian 矩阵，非对角元素代表变量间的耦合强度。
+
+    H[i,j] ≈ ∂²J / ∂ci∂cj
+
+    |H[i,j]| 大 → i,j 之间耦合强
+    |H[i,j]| ≈ 0 → i,j 之间独立
+    """
+    nZ = len(c_base)
+    H = np.zeros((nZ, nZ))
+    J0 = cost_func(c_base)
+
+    for i in range(nZ):
+        for j in range(i, nZ):
+            c_pp = c_base.copy();c_pp[i] += eps; c_pp[j] += eps
+            c_pm = c_base.copy();c_pm[i] += eps;c_pm[j] -= eps
+            c_mp = c_base.copy();c_mp[i] -= eps;c_mp[j] += eps
+            c_mm = c_base.copy();c_mm[i] -= eps;c_mm[j] -= eps
+            H[i, j] = (cost_func(c_pp) - cost_func(c_pm)
+                       - cost_func(c_mp) + cost_func(c_mm)) / (4 * eps ** 2)
+            H[j, i] = H[i, j]  # 对称
+
+    # 归一化：相关矩阵
+    diag = np.sqrt(np.diag(H))
+    denom = np.outer(diag, diag) + 1e-30
+    corr = H / denom  # 类似相关系数，[-1,1]
+
+    # 画图
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    im0 = axes[0].imshow(H, cmap='RdBu_r', aspect='auto')
+    plt.colorbar(im0, ax=axes[0])
+    axes[0].set_title("Hessian 矩阵（∂²J/∂ci∂cj）")
+    axes[0].set_xlabel("Zernike 索引");axes[0].set_ylabel("Zernike 索引")
+    # 标注数值
+    for i in range(nZ):
+        for j in range(nZ):
+            axes[0].text(j, i, f"{H[i, j]:.1e}",
+                         ha='center', va='center', fontsize=6)
+
+    im1 = axes[1].imshow(corr, cmap='RdBu_r', vmin=-1, vmax=1, aspect='auto')
+    plt.colorbar(im1, ax=axes[1])
+    axes[1].set_title("归一化耦合矩阵\n|值|>0.3 表示存在显著耦合")
+    axes[1].set_xlabel("Zernike 索引");axes[1].set_ylabel("Zernike 索引")
+    for i in range(nZ):
+        for j in range(nZ):
+            axes[1].text(j, i, f"{corr[i, j]:.2f}",
+                         ha='center', va='center', fontsize=6)
+
+    plt.tight_layout()
+    plt.savefig("image_test3/hessian_coupling_OTFloss.png", dpi=150)
+    plt.show()
+
+    # 找出耦合强的变量对
+    threshold = 0.3
+    print("\n显著耦合的变量对（|corr| > 0.3）：")
+    found = False
+    for i in range(nZ):
+        for j in range(i + 1, nZ):
+            if abs(corr[i, j]) > threshold:
+                print(f"  Z{i + 1} ↔ Z{j + 1}: corr = {corr[i, j]:+.3f}")
+                found = True
+    if not found:
+        print("  ✅ 未发现显著耦合")
+
+    return H, corr
+
+def sensitivity_scan(image_focus, image_de_list, Z_UDA,
                      coff_div_list, F0,
                      wvl=2e-6, d1=None, d2=2e-6 / 1e-4, Dz=132.812,
                      gamma=1e-6, alpha=0.0,
@@ -412,13 +494,15 @@ def sensitivity_scan(PSF_focus, PSF_de_list, Z_UDA,
     对每个 Zernike 系数单独扫描损失函数，判断 F0 是否在最小值附近。
 
     参数:
-        F0          : (nZ,) 基准 Zernike 系数（待验证的点）
-        scan_range  : 每个系数的扫描范围 ± scan_range
-        scan_steps  : 每个系数的扫描点数
+        image_focus  : (H,W) numpy，焦面图像（任意场景）
+        image_de_list: list of (H,W) numpy，多张离焦图像
+        F0           : (nZ,) 基准 Zernike 系数（待验证的点）
+        scan_range   : 每个系数的扫描范围 ± scan_range
+        scan_steps   : 每个系数的扫描点数
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    H, W = PSF_focus.shape
+    H, W = image_focus.shape
     nZ = len(F0)
 
     if d1 is None:
@@ -429,29 +513,34 @@ def sensitivity_scan(PSF_focus, PSF_de_list, Z_UDA,
         return torch.tensor(np.array(x).astype(np.float32),
                             dtype=torch.float32, device=device)
 
-    # 预先准备张量
-    PSF_focus_t = to_t(PSF_focus)
-    PSF_de_list_t = [to_t(p) for p in PSF_de_list]
-    Z_mat = to_t(np.stack(Z_UDA, axis=-1))
-    pupil_mask = to_t((np.abs(Z_UDA[0]) > 0).astype(np.float32))
-    delta_focus = torch.zeros(H, W, dtype=torch.float32, device=device)
+    # ── 数据预处理：图像 → FFT，合并为 imgDs (H,W,K) ─────────────────────
+    I_focus   = torch.fft.fft2(to_t(image_focus)).to(torch.complex64)
+    I_de_list = [torch.fft.fft2(to_t(im)).to(torch.complex64)
+                 for im in image_de_list]
+    imgDs     = torch.stack([I_focus] + I_de_list, dim=2)   # (H,W,K)
 
+    # ── Zernike 基底 / 瞳函数 ────────────────────────────────────────────
+    Z_mat      = to_t(np.stack(Z_UDA, axis=-1))
+    pupil_mask = to_t((np.abs(Z_UDA[0]) > 0).astype(np.float32))
+
+    # ── 多样性像差：合并为 wavefront_deltas (H,W,K) ───────────────────────
+    delta_focus = torch.zeros(H, W, dtype=torch.float32, device=device)
     delta_de_list = []
     for coff in coff_div_list:
         wf_de = plot_wavefront_from_zernike(Z_UDA, coff)
         delta_de_list.append(to_t(wf_de.astype(np.float32)))
+    wavefront_deltas = torch.stack([delta_focus] + delta_de_list, dim=2)  # (H,W,K)
 
-    # 扫描轴
+    # ── 扫描轴 ────────────────────────────────────────────────────────────
     scan_vals = np.linspace(-scan_range, scan_range, scan_steps)
 
-    # 计算 F0 处的基准损失
+    # ── 计算 F0 处的基准损失 ──────────────────────────────────────────────
     with torch.no_grad():
         c_base = to_t(F0)
-        J_base = cost_pd(c_base, Z_mat, pupil_mask,
-                         PSF_focus_t, PSF_de_list_t,
-                         delta_focus, delta_de_list,
-                         wvl, d1, d2, Dz, device,
-                         gamma=gamma, alpha=alpha).item()
+        J_base = cost_pd_image(c_base, Z_mat, pupil_mask,
+                               imgDs, wavefront_deltas,
+                               wvl, d1, d2, Dz, device,
+                               gamma=gamma, alpha=alpha).item()
     print(f"F0 处基准损失 J = {J_base:.6e}")
 
     # ── 逐项扫描 ──────────────────────────────────────────────────────────
@@ -460,13 +549,12 @@ def sensitivity_scan(PSF_focus, PSF_de_list, Z_UDA,
     for j in range(nZ):
         for k, dv in enumerate(scan_vals):
             c_scan = F0.copy()
-            c_scan[j] += dv  # 只扰动第 j 项
+            c_scan[j] += dv                  # 只扰动第 j 项
             with torch.no_grad():
                 c_t = to_t(c_scan)
-                J_curves[j, k] = cost_pd(
+                J_curves[j, k] = cost_pd_image(
                     c_t, Z_mat, pupil_mask,
-                    PSF_focus_t, PSF_de_list_t,
-                    delta_focus, delta_de_list,
+                    imgDs, wavefront_deltas,
                     wvl, d1, d2, Dz, device,
                     gamma=gamma, alpha=alpha
                 ).item()
@@ -494,99 +582,15 @@ def sensitivity_scan(PSF_focus, PSF_de_list, Z_UDA,
         ax.legend(fontsize=7)
         ax.grid(True, alpha=0.3)
 
-    # 隐藏多余子图
     for j in range(nZ, len(axes)):
         axes[j].set_visible(False)
 
     fig.suptitle("灵敏度扫描：各 Zernike 系数对损失函数的影响\n"
                  "红线=F0位置，绿线=最小值位置", fontsize=13, fontweight='bold')
     plt.tight_layout()
-    os.makedirs("image", exist_ok=True)
-    plt.savefig("image_test3/sensitivity_scan_PSFloss.png", dpi=150)
+    os.makedirs("image_test3", exist_ok=True)
+    plt.savefig("image_test3/sensitivity_scan_OTFloss.png", dpi=150)
     plt.show()
-    print("灵敏度扫描图已保存: image_test3/sensitivity_scan_PSFloss.png")
+    print("灵敏度扫描图已保存: image_test3/sensitivity_scan_OTFloss.png")
 
     return J_curves, scan_vals
-
-# ============================================================
-# Hessian 矩阵耦合分析
-# ============================================================
-
-def compute_hessian(cost_func, c_base, eps=1e-3):
-    """
-    数值计算 Hessian 矩阵，分析变量间耦合关系。
-
-    参数:
-        cost_func : 损失函数，接受 (nZ,) numpy array，返回 float
-        c_base    : (nZ,) numpy array，分析点（通常传入优化结果 c_est）
-        eps       : 数值差分步长
-
-    返回:
-        H    : (nZ,nZ) Hessian 矩阵
-        corr : (nZ,nZ) 归一化耦合矩阵，值域 [-1,1]
-    """
-    nZ = len(c_base)
-    H  = np.zeros((nZ, nZ))
-
-    print("计算 Hessian 矩阵...")
-    for i in range(nZ):
-        for j in range(i, nZ):
-            c_pp = c_base.copy(); c_pp[i] += eps; c_pp[j] += eps
-            c_pm = c_base.copy(); c_pm[i] += eps; c_pm[j] -= eps
-            c_mp = c_base.copy(); c_mp[i] -= eps; c_mp[j] += eps
-            c_mm = c_base.copy(); c_mm[i] -= eps; c_mm[j] -= eps
-
-            H[i, j] = (cost_func(c_pp) - cost_func(c_pm)
-                       - cost_func(c_mp) + cost_func(c_mm)) / (4 * eps ** 2)
-            H[j, i] = H[i, j]   # 对称矩阵
-
-        if (i + 1) % 5 == 0:
-            print(f"  进度: {i+1}/{nZ}")
-
-    # 归一化为相关矩阵
-    diag  = np.sqrt(np.abs(np.diag(H)))
-    denom = np.outer(diag, diag) + 1e-30
-    corr  = H / denom
-
-    # ── 画图 ──────────────────────────────────────────────────────────────
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-
-    im0 = axes[0].imshow(H, cmap='RdBu_r', aspect='auto')
-    plt.colorbar(im0, ax=axes[0])
-    axes[0].set_title("Hessian 矩阵（∂²J / ∂ci∂cj）")
-    axes[0].set_xlabel("Zernike 索引")
-    axes[0].set_ylabel("Zernike 索引")
-    # 标注数值
-    for i in range(nZ):
-        for j in range(nZ):
-            axes[0].text(j, i, f"{H[i,j]:.1e}",
-                         ha='center', va='center', fontsize=6)
-
-    im1 = axes[1].imshow(corr, cmap='RdBu_r', vmin=-1, vmax=1, aspect='auto')
-    plt.colorbar(im1, ax=axes[1])
-    axes[1].set_title("归一化耦合矩阵\n|值| > 0.3 表示显著耦合")
-    axes[1].set_xlabel("Zernike 索引")
-    axes[1].set_ylabel("Zernike 索引")
-    for i in range(nZ):
-        for j in range(nZ):
-            axes[1].text(j, i, f"{corr[i,j]:.2f}",
-                         ha='center', va='center', fontsize=6)
-
-    plt.tight_layout()
-    os.makedirs("image_test3", exist_ok=True)
-    plt.savefig("image_test3/hessian_coupling_PSFloss.png", dpi=150)
-    plt.show()
-
-    # ── 打印显著耦合对 ────────────────────────────────────────────────────
-    threshold = 0.3
-    print("\n显著耦合的变量对（|corr| > 0.3，排除对角线）：")
-    found = False
-    for i in range(nZ):
-        for j in range(i + 1, nZ):
-            if abs(corr[i, j]) > threshold:
-                print(f"  Z{i+1:02d} ↔ Z{j+1:02d} : corr = {corr[i,j]:+.3f}")
-                found = True
-    if not found:
-        print("  ✅ 未发现显著耦合（所有非对角元 |corr| ≤ 0.3）")
-
-    return H, corr
