@@ -141,17 +141,9 @@ def phase_diversity_retrieve(image_focus, image_de_list, Z_UDA,
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}，离焦图片数量: {n_de}")
 
-    H, W = image_focus.shape    # 以图像尺寸为基准
+    H, W = image_focus.shape
     nZ   = len(Z_UDA)
 
-    # Zernike 基底 resize 到图像大小
-    from scipy.ndimage import zoom
-    def resize_zernike(z, H_new, W_new):
-        scale_h = H_new / z.shape[0]
-        scale_w = W_new / z.shape[1]
-        return zoom(z.astype(np.float32), (scale_h, scale_w), order=1)
-
-    Z_UDA_resized = [resize_zernike(z, H, W) for z in Z_UDA]
     if d1 is None:
         a  = 1e-4
         d1 = 6.605 * a / H
@@ -172,8 +164,8 @@ def phase_diversity_retrieve(image_focus, image_de_list, Z_UDA,
     imgDs = torch.stack([I_focus] + I_de_list, dim=2)  # (H,W,1+n_de)
 
     # ── Zernike 基底 / 瞳函数 ────────────────────────────────────────────
-    Z_mat = to_t(np.stack(Z_UDA_resized, axis=-1))
-    pupil_mask = to_t((np.abs(Z_UDA_resized[0]) > 0).astype(np.float32))
+    Z_mat = to_t(np.stack(Z_UDA, axis=-1))
+    pupil_mask = to_t((np.abs(Z_UDA[0]) > 0).astype(np.float32))
 
     # ── 焦面多样性像差（零）──────────────────────────────────────────────
     delta_focus = torch.zeros(H, W, dtype=torch.float32, device=device)
@@ -184,7 +176,7 @@ def phase_diversity_retrieve(image_focus, image_de_list, Z_UDA,
 
     for k in range(n_de):
         if coff_div_list is not None:
-            wf_de = plot_wavefront_from_zernike(Z_UDA_resized, coff_div_list[k])
+            wf_de = plot_wavefront_from_zernike(Z_UDA, coff_div_list[k])
             delta_list.append(to_t(wf_de.astype(np.float32)))
         else:
             delta_list.append(torch.zeros(H, W, dtype=torch.float32, device=device))
@@ -253,124 +245,7 @@ def phase_diversity_retrieve(image_focus, image_de_list, Z_UDA,
 
     return c_est, J_hist, wavefront_est
 
-# ============================================================
-# 物体估计：优化完成后，用最优系数恢复物体
-# ============================================================
 
-def estimate_object(c_est, Z_UDA, image_focus, image_de_list,
-                    coff_div_list=None,
-                    wvl=2e-6, d1=None, d2=2e-6/1e-4, Dz=132.812,
-                    gamma=1e-6):
-    """
-    用最优 Zernike 系数恢复物体估计。
-
-    物体估计公式：
-        Ô(u) = Σ_k Sk*(u)·Dk(u) / Q(u)
-        Q(u) = Σ_k|Sk(u)|² + γ
-        o(x) = Re{ F⁻¹{ Ô(u) } },  o ≥ 0
-
-    参数:
-        c_est          : (nZ,) numpy，优化得到的 Zernike 系数
-        Z_UDA          : list of (H,W)，Zernike 基底
-        image_focus    : (H,W) numpy，焦面图像
-        image_de_list  : list of (H,W) numpy，离焦图像列表
-        coff_div_list  : list of (nZ,) numpy，各离焦图的已知系数
-        gamma          : 正则化参数（与优化时保持一致）
-
-    返回:
-        obj_est        : (H,W) numpy，恢复的物体估计（实数，非负）
-        obj_fft        : (H,W) numpy complex，物体频域估计
-    """
-    if isinstance(image_de_list, np.ndarray):
-        image_de_list = [image_de_list]
-    if coff_div_list is not None and isinstance(coff_div_list, np.ndarray):
-        coff_div_list = [coff_div_list]
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    H, W = image_focus.shape
-    nZ   = len(Z_UDA)
-    n_de = len(image_de_list)
-
-    if d1 is None:
-        d1 = 6.605 * 1e-4 / H
-
-    def to_t(x):
-        return torch.tensor(np.array(x).astype(np.float32),
-                            dtype=torch.float32, device=device)
-
-    # ── 数据准备 ──────────────────────────────────────────────────────────
-    c_t        = to_t(c_est)
-    Z_mat      = to_t(np.stack(Z_UDA, axis=-1))
-    pupil_mask = to_t((np.abs(Z_UDA[0]) > 0).astype(np.float32))
-
-    # 图像 → FFT → imgDs (H,W,K)
-    def img_to_fft(img):
-        return torch.fft.fft2(to_t(img)).to(torch.complex64)
-
-    imgDs = torch.stack(
-        [img_to_fft(image_focus)] + [img_to_fft(im) for im in image_de_list],
-        dim=2
-    )   # (H,W,K)
-
-    # 多样性像差 wavefront_deltas (H,W,K)
-    delta_focus = torch.zeros(H, W, dtype=torch.float32, device=device)
-    delta_list  = [delta_focus]
-    for k in range(n_de):
-        if coff_div_list is not None:
-            wf_de = plot_wavefront_from_zernike(Z_UDA, coff_div_list[k])
-            delta_list.append(to_t(wf_de.astype(np.float32)))
-        else:
-            delta_list.append(torch.zeros(H, W, dtype=torch.float32, device=device))
-    wavefront_deltas = torch.stack(delta_list, dim=2)   # (H,W,K)
-
-    # ── 计算物体估计 ──────────────────────────────────────────────────────
-    with torch.no_grad():
-        K = imgDs.shape[2]
-
-        # 计算各张图的 OTF
-        Sks = torch.stack([
-            forward_otf(c_t, Z_mat, pupil_mask,
-                        wavefront_deltas[:, :, k],
-                        wvl, d1, d2, Dz, device)
-            for k in range(K)
-        ], dim=2)   # (H,W,K)
-
-        # Q = Σ|Sk|² + γ
-        Q = torch.sum(torch.abs(Sks) ** 2, dim=2) + gamma   # (H,W)
-
-        # 物体频域估计：Ô = Σ Sk*·Dk / Q
-        O_hat = torch.sum(torch.conj(Sks) * imgDs, dim=2) / Q   # (H,W) complex
-
-        # 物体空域估计：ifft2，取实部，截断负值
-        obj_est = torch.real(torch.fft.ifft2(O_hat))
-        obj_est = torch.clamp(obj_est, min=0.0)
-
-    obj_est_np = obj_est.cpu().numpy()
-    obj_fft_np = O_hat.cpu().numpy()
-
-    # ── 画图 ──────────────────────────────────────────────────────────────
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-
-    im0 = axes[0].imshow(image_focus, origin='lower', cmap='hot', aspect='auto')
-    plt.colorbar(im0, ax=axes[0])
-    axes[0].set_title("输入焦面图像")
-
-    im1 = axes[1].imshow(obj_est_np, origin='lower', cmap='hot', aspect='auto')
-    plt.colorbar(im1, ax=axes[1])
-    axes[1].set_title("恢复的物体估计 o(x)")
-
-    im2 = axes[2].imshow(np.log1p(np.abs(obj_fft_np)),
-                          origin='lower', cmap='viridis', aspect='auto')
-    plt.colorbar(im2, ax=axes[2])
-    axes[2].set_title("物体频域幅值 log|Ô(u)|")
-
-    plt.suptitle("物体估计结果", fontsize=13, fontweight='bold')
-    plt.tight_layout()
-    os.makedirs("image_test4", exist_ok=True)
-    plt.savefig("image_test4/object_estimate.png", dpi=150)
-    plt.show()
-
-    return obj_est_np, obj_fft_np
 # ============================================================
 # 画图函数：支持多张离焦 PSF 对比
 # ============================================================
@@ -414,9 +289,8 @@ def plot_phase_diversity_result(PSF_focus, PSF_de_list,
     with torch.no_grad():
         OTF_pred_focus = forward_otf(c_t, Z_mat, pupil_mask, delta_focus,
                                       wvl, d1, d2, Dz, device)
-        PSF_pred_focus = torch.abs(torch.fft.ifft2(OTF_pred_focus))  # tensor → tensor
-        PSF_pred_focus = PSF_pred_focus / (PSF_pred_focus.max() + 1e-30)
-        PSF_pred_focus = PSF_pred_focus.cpu().numpy()  # 最后统一转 numpy
+        PSF_pred_focus = torch.abs(torch.fft.ifft2(OTF_pred_focus)).cpu().numpy()
+        PSF_pred_focus=PSF_pred_focus/PSF_pred_focus.max()
 
     # ── 重建各张离焦 PSF ──────────────────────────────────────────────────
     PSF_pred_de_list = []
@@ -429,10 +303,9 @@ def plot_phase_diversity_result(PSF_focus, PSF_de_list,
         with torch.no_grad():
             OTF_pred_de = forward_otf(c_t, Z_mat, pupil_mask, delta_de,
                                     wvl, d1, d2, Dz, device)
-            PSF_pred_de = torch.abs(torch.fft.ifft2(OTF_pred_de))  # tensor → tensor
-            PSF_pred_de = PSF_pred_de / (PSF_pred_de.max() + 1e-30)
-            PSF_pred_de = PSF_pred_de.cpu().numpy()  # 最后统一转 numpy
-        PSF_pred_de_list.append(PSF_pred_de)
+            PSF_pred_de = torch.abs(torch.fft.ifft2(OTF_pred_de)).cpu().numpy()
+            psf_pred_de=PSF_pred_de/PSF_pred_de.max()
+        PSF_pred_de_list.append(psf_pred_de)
 
     # ── 波前 / 系数差值 ───────────────────────────────────────────────────
     pupil_np = (np.abs(Z_UDA[0]) > 0).astype(float)
@@ -722,55 +595,164 @@ def sensitivity_scan(image_focus, image_de_list, Z_UDA,
 
     return J_curves, scan_vals
 
-def simulate_imaging(image, PSF, d_image, d_psf):
+def estimate_object(c_est, Z_UDA, image_focus, image_de_list,
+                    coff_div_list=None,
+                    wvl=2e-6, d1=None, d2=2e-6/1e-4, Dz=132.812,
+                    gamma=1e-30):
     """
-    模拟图像通过光学系统的效果（空域卷积）。
-    当图像像素大小 > PSF像素大小时，自动将图像插值放大到与PSF像素大小一致。
+    用 Zernike 系数恢复物体估计。
+
+    Ô(u) = Σ_k Sk*(u)·Dk(u) / Q(u)
+    Q(u) = Σ_k|Sk(u)|² + γ
+    o(x) = Re{ F⁻¹{ Ô(u) } },  o ≥ 0
 
     参数:
-        image   : (H,W) numpy，输入图像
-        PSF     : (h,w) numpy，点扩散函数
-        d_image : 图像像素大小 (m/pixel)
-        d_psf   : PSF像素大小 (m/pixel)
+        c_est         : (nZ,) numpy，Zernike 系数（传 F0 验证，或传优化结果）
+        Z_UDA         : list of (H,W)，Zernike 基底
+        image_focus   : (H,W) numpy，焦面图像（sum归一）
+        image_de_list : list of (H,W) numpy，离焦图像列表（sum归一）
+        coff_div_list : list of (nZ,) numpy，各离焦图的已知系数增量
+        gamma         : 正则化参数（验证时用 1e-30）
 
     返回:
-        img_out         : (H*scale, W*scale) numpy，模糊后的图像
-        image_upsampled : (H*scale, W*scale) numpy，放大后的原始图像（用于对比）
+        obj_est  : (H,W) numpy，恢复的物体估计（实数，非负）
+        obj_fft  : (H,W) numpy complex，物体频域估计 Ô(u)
     """
+    if isinstance(image_de_list, np.ndarray):
+        image_de_list = [image_de_list]
+    if coff_div_list is not None and isinstance(coff_div_list, np.ndarray):
+        coff_div_list = [coff_div_list]
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    H, W = Z_UDA[0].shape
+    nZ   = len(Z_UDA)
+    n_de = len(image_de_list)
+
+    if d1 is None:
+        d1 = 6.605 * 1e-4 / H
+
+    def to_t(x):
+        return torch.tensor(np.array(x).astype(np.float32),
+                            dtype=torch.float32, device=device)
+
+    # ── 数据准备 ──────────────────────────────────────────────────────────
+    c_t        = to_t(c_est)
+    Z_mat      = to_t(np.stack(Z_UDA, axis=-1))
+    pupil_mask = to_t((np.abs(Z_UDA[0]) > 0).astype(np.float32))
+
+    # 图像 resize 到 Zernike 基底尺寸后做 FFT
     from scipy.ndimage import zoom
-    from scipy.signal import fftconvolve
 
-    if d_image < d_psf:
-        raise ValueError(
-            f"图像像素({d_image*1e6:.3f} μm) < PSF像素({d_psf*1e6:.3f} μm)，"
-            f"请检查参数。"
-        )
+    def img_to_fft(img):
+        if img.shape != (H, W):
+            scale_h = H / img.shape[0]
+            scale_w = W / img.shape[1]
+            img = zoom(img.astype(np.float32), (scale_h, scale_w), order=1)
+        return torch.fft.fft2(to_t(img)).to(torch.complex64)
 
-    H, W = image.shape
+    imgDs = torch.stack(
+        [img_to_fft(image_focus)] + [img_to_fft(im) for im in image_de_list],
+        dim=2
+    )  # (H,W,K)
 
-    # ── 计算放大倍数 ──────────────────────────────────────────────────────
-    scale = d_image / d_psf
-    new_H = int(round(H * scale))
-    new_W = int(round(W * scale))
+    # 多样性像差 wavefront_deltas (H,W,K)
+    delta_focus = torch.zeros(H, W, dtype=torch.float32, device=device)
+    delta_list  = [delta_focus]
+    for k in range(n_de):
+        if coff_div_list is not None:
+            wf_de = plot_wavefront_from_zernike(Z_UDA, coff_div_list[k])
+            delta_list.append(to_t(wf_de.astype(np.float32)))
+        else:
+            delta_list.append(torch.zeros(H, W, dtype=torch.float32, device=device))
+    wavefront_deltas = torch.stack(delta_list, dim=2)  # (H,W,K)
 
-    print(f"图像像素大小 : {d_image*1e6:.3f} μm/pixel")
-    print(f"PSF 像素大小 : {d_psf*1e6:.3f} μm/pixel")
-    print(f"放大倍数     : {scale:.3f}x")
-    print(f"图像尺寸     : ({H},{W}) → ({new_H},{new_W})")
+    # ── 计算物体估计 ──────────────────────────────────────────────────────
+    with torch.no_grad():
+        K = imgDs.shape[2]
 
-    # ── 图像插值放大（保持物理尺寸不变，像素变小）────────────────────────
-    image_upsampled = zoom(image.astype(np.float32),
-                           (new_H / H, new_W / W),
-                           order=1)  # 双线性插值
-    image_upsampled = image_upsampled / (image_upsampled.max() + 1e-30)
-    # ── PSF 能量归一化 ────────────────────────────────────────────────────
-    PSF_norm = PSF.astype(np.float32) / (PSF.max() + 1e-30)
+        Sks = torch.stack([
+            forward_otf(c_t, Z_mat, pupil_mask,
+                        wavefront_deltas[:, :, k],
+                        wvl, d1, d2, Dz, device)
+            for k in range(K)
+        ], dim=2)  # (H,W,K)
 
-    # ── 空域卷积，输出与放大后图像尺寸一致 ───────────────────────────────
-    img_out = fftconvolve(image_upsampled, PSF_norm, mode='same')
+        S0 = Sks[:, :, 0].cpu().numpy()
+        D0 = imgDs[:, :, 0].cpu().numpy()
 
-    # ── 归一化到 [0,1] ────────────────────────────────────────────────────
-    img_out = np.clip(img_out, 0, None)
-    img_out = img_out / (img_out.max() + 1e-30)
+        S0_amp = np.abs(S0)
+        D0_amp = np.abs(D0)
 
-    return img_out, image_upsampled
+        print(f"S0 瞳内幅值均值: {S0_amp.mean():.6f}")
+        print(f"D0 瞳内幅值均值: {D0_amp.mean():.6f}")
+        print(f"比值 D0/S0:      {(D0_amp / (S0_amp + 1e-30)).mean():.4f}")
+        # 打印输入图像的基本统计
+        print(f"image_focus: max={image_focus.max():.6e}, sum={image_focus.sum():.6e}, mean={image_focus.mean():.6e}")
+        print(f"image_focus 非零像素数: {(image_focus > 0).sum()}")
+        print(f"image_focus shape: {image_focus.shape}")
+
+        # 打印 D0 的统计
+        D0 = imgDs[:, :, 0].cpu().numpy()
+        print(f"D0 max={np.abs(D0).max():.6e}, mean={np.abs(D0).mean():.6e}")
+
+        # 打印 S0 的统计
+        S0 = Sks[:, :, 0].cpu().numpy()
+        print(f"S0 max={np.abs(S0).max():.6e}, mean={np.abs(S0).mean():.6e}")
+
+        Q     = torch.sum(torch.abs(Sks) ** 2, dim=2) + gamma  # (H,W)
+        O_hat = torch.sum(torch.conj(Sks) * imgDs, dim=2) / Q  # (H,W) complex
+
+        obj_est = torch.real(torch.fft.ifft2(O_hat))
+        obj_est = torch.fft.fftshift(obj_est)  # ← 加这一行，delta移到中心
+        obj_est = torch.clamp(obj_est, min=0.0)
+
+    obj_est_np = obj_est.cpu().numpy()
+    obj_fft_np = O_hat.cpu().numpy()
+
+    # ── 画图 ──────────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
+
+    im0 = axes[0].imshow(image_focus, origin='lower', cmap='hot', aspect='equal')
+    plt.colorbar(im0, ax=axes[0])
+    axes[0].set_title("输入焦面图像")
+
+    im1 = axes[1].imshow(obj_est_np, origin='lower', cmap='hot', aspect='equal')
+    plt.colorbar(im1, ax=axes[1])
+    axes[1].set_title("恢复的物体估计 o(x)")
+
+    # 只统计瞳内非零区域
+    pupil_mask_np = (np.abs(Z_UDA[0]) > 0).astype(bool)
+
+    # 把 pupil_mask resize 到 obj_fft 大小
+    amp = np.abs(obj_fft_np)
+    amp_pupil = amp[pupil_mask_np]
+    im2 = axes[2].imshow(np.fft.fftshift(amp), origin='lower',
+                          cmap='hot', aspect='equal')
+    plt.colorbar(im2, ax=axes[2])
+    axes[2].set_title(f"频域幅值 |Ô(u)|\nmean={amp.mean():.4f}, "
+                      f"min={amp.min():.4f}, max={amp.max():.4f}")
+
+    # 期望值与1的偏差
+    deviation = amp - 1.0
+    im3 = axes[3].imshow(np.fft.fftshift(deviation), origin='lower',
+                          cmap='RdBu_r', aspect='equal',
+                          vmin=-np.abs(deviation).max(),
+                          vmax= np.abs(deviation).max())
+    plt.colorbar(im3, ax=axes[3])
+    axes[3].set_title(f"偏差 |Ô|-1\nRMS={np.std(deviation):.4f}")
+
+    plt.suptitle("物体估计验证（期望：频域幅值全为1）",
+                 fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    os.makedirs("image_test4", exist_ok=True)
+    plt.savefig("image_test4/object_estimate_verify.png", dpi=150)
+    plt.show()
+
+    # ── 打印统计 ──────────────────────────────────────────────────────────
+    print(f"\n物体频域幅值统计：")
+    print(f"  均值  : {amp.mean():.6f}  （期望 ≈ 1.0）")
+    print(f"  最小值: {amp.min():.6f}")
+    print(f"  最大值: {amp.max():.6f}")
+    print(f"  标准差: {amp.std():.6f}  （期望 ≈ 0.0）")
+
+    return obj_est_np, obj_fft_np

@@ -4,7 +4,6 @@ import numpy as np
 import matplotlib
 matplotlib.use('TkAgg')  # 在 import pyplot 之前设置
 import matplotlib.pyplot as plt
-import matplotlib.image as mpimg
 import matplotlib.font_manager as fm
 from itertools import islice
 from fresnel_utils import (
@@ -17,12 +16,11 @@ from fresnel_utils import (
     )
 from PD_func import(
     phase_diversity_retrieve,
-    estimate_object,
     plot_phase_diversity_result,
     sensitivity_scan,
     compute_hessian,
     cost_pd_image,
-    simulate_imaging
+    estimate_object
 )
 # This boilerplate requires the 'pythonnet' module.
 # The following instructions are for installing the 'pythonnet' module via pip:
@@ -165,13 +163,11 @@ matplotlib.rcParams['axes.unicode_minus'] = False  # 修复负号显示
 a       = 1e-4              # 归一化单位 (m)
 N0      = 512               # 采样点数
 d1      = 6.605 * a / N0    # 源平面采样间距 (m)
-d2      = 10e-6 / a          # 像面采样间距 (m)
+d2      = 2e-6 / a          # 像面采样间距 (m)
 D1      = 6.605 * a         # 系统孔径 (m)
 D2      = 512 * d2          # 接收面尺寸 (m)
 wvl     = 2e-6              # 波长 (m)
 Dz      = 132.812           # 传播距离/焦距 (m)
-gamma   = 0              # 损失函数分母的正则化系数
-tol     = 1e-6              # 损失函数收敛阈值
 # ============================================================
 # 2. 加载文件
 # ============================================================
@@ -202,7 +198,7 @@ wavefront_settings.UseExitPupil = False
 PSF_settings = PSF_analysis.GetSettings()
 PSF_settings.PupilSampleSize  = ZOSAPI.Analysis.SampleSizes.S_128x128
 PSF_settings.ImageSampleSize  = ZOSAPI.Analysis.SampleSizes.S_512x512
-PSF_settings.ImageDelta       = 10
+PSF_settings.ImageDelta       = 2
 PSF_settings.ShowAsType       = ZOSAPI.Analysis.HuygensShowAsTypes.InverseGreyScale
 PSF_settings.Normalize        = True
 PSF_settings.UseCentroid      = False
@@ -232,7 +228,7 @@ PSF_matrix_zemax = PSF_matrix_zemax.reshape(psf_ny, psf_nx)  # ✅ reshape
 # 对应 MATLAB: flip(flip(PSF_matrix_zemax, 1), 2)
 # MATLAB axis 1 = 行(上下翻转), axis 2 = 列(左右翻转)
 PSF_matrix_focus = np.flip(np.flip(PSF_matrix_zemax, axis=0), axis=1)
-PSF_matrix_focus_norm=PSF_matrix_focus/PSF_matrix_focus.max()
+PSF_matrix_focus_norm=PSF_matrix_focus/PSF_matrix_focus.sum()
 # ============================================================
 # 构建zernike基底
 # ============================================================
@@ -258,7 +254,7 @@ defocus_steps =[-2,-1,1,2]
 coff_div_list      = []   # 每个离焦量对应的 Zernike 系数
 PSF_de_norm_list   = []   # 每个离焦量对应的归一化 PSF
 for step in defocus_steps:
-    scGroup.Thickness = step*0.04
+    scGroup.Thickness = step*0.02
     # ============================================================
     # 10. 获取离焦后波前图
     # ============================================================
@@ -284,7 +280,7 @@ for step in defocus_steps:
     # 对应 MATLAB: flip(flip(PSF_matrix_zemax, 1), 2)
     # MATLAB axis 1 = 行(上下翻转), axis 2 = 列(左右翻转)
     PSF_matrix_de = np.flip(np.flip(PSF_matrix_zemax, axis=0), axis=1)
-    PSF_matrix_de_norm=PSF_matrix_de /PSF_matrix_de.max()
+    PSF_matrix_de_norm=PSF_matrix_de /PSF_matrix_de.sum()
     PSF_de_norm_list.append(PSF_matrix_de_norm)
 # ============================================================
 # 13. 恢复原始厚度
@@ -351,119 +347,91 @@ print(f"已恢复原始厚度: {temp_focus} mm")
 # plt.show()
 Z_UDA_10=Z_UDA[:10]
 coff_div_list_10 = [c[:10] for c in coff_div_list]
-# # ============================================================
-# # 统一准备所有中间变量（在调用优化和诊断函数之前运行一次）
-# # ============================================================
-#
-# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-# image_focus=PSF_matrix_focus_norm
-# image_de_norm_list=PSF_de_norm_list
-# H, W = image_focus.shape
-# nZ   = len(Z_UDA_10)
-# gamma = 1e-6
-#
-# def to_t(x):
-#     return torch.tensor(np.array(x).astype(np.float32),
-#                         dtype=torch.float32, device=device)
-#
-# # Zernike 基底 / 瞳函数
-# Z_mat      = to_t(np.stack(Z_UDA_10, axis=-1))
-# pupil_mask = to_t((np.abs(Z_UDA_10[0]) > 0).astype(np.float32))
-#
-# # 图像 → FFT → imgDs (H,W,K)
-# I_focus   = torch.fft.fft2(to_t(image_focus)).to(torch.complex64)
-# I_de_list = [torch.fft.fft2(to_t(im)).to(torch.complex64)
-#              for im in image_de_norm_list]
-# imgDs     = torch.stack([I_focus] + I_de_list, dim=2)
-#
-# # 多样性像差 → wavefront_deltas (H,W,K)
-# delta_focus = torch.zeros(H, W, dtype=torch.float32, device=device)
-# delta_de_list = [to_t(plot_wavefront_from_zernike(Z_UDA_10, coff).astype(np.float32))
-#                  for coff in coff_div_list_10]
-# wavefront_deltas = torch.stack([delta_focus] + delta_de_list, dim=2)
-#
-# # ============================================================
-# # 包装损失函数为纯 numpy 接口
-# # ============================================================
-# def cost_np(c_np):
-#     with torch.no_grad():
-#         c_t = torch.tensor(c_np.astype(np.float32), device=device)
-#         return cost_pd_image(c_t, Z_mat, pupil_mask,
-#                              imgDs, wavefront_deltas,
-#                              wvl, d1, d2, Dz, device,
-#                              gamma=gamma).item()
-#
-# # ============================================================
-# # 调用诊断函数
-# # ============================================================
-# # Hessian 耦合分析
-# H_mat, corr = compute_hessian(cost_np, F0[:10], eps=1e-3)
-# # 灵敏度扫描，确保F0的系数（真值）对于损失函数而言是最小值
-# J_curves, scan_vals = sensitivity_scan(
-#     PSF_matrix_focus_norm,
-#     PSF_de_norm_list,
-#     Z_UDA_10,
-#     coff_div_list=coff_div_list_10,
-#     F0=F0[:10],
-#     wvl=wvl, d1=d1,
-#     d2=d2, Dz=Dz,
-#     scan_range=0.5,    # 每个系数扰动范围 ±0.5
-#     scan_steps=41      # 扫描点数
-# )
 # ============================================================
-# 导入图片
+# 统一准备所有中间变量（在调用优化和诊断函数之前运行一次）
 # ============================================================
-def load_image(path):
-    img = mpimg.imread(path)          # 读取图片，值域自动处理
-    if img.ndim == 3:
-        img = np.mean(img, axis=2)    # RGB → 灰度
-    img = img.astype(np.float32)
-    img = img / (img.max() + 1e-30)
-    return img
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+image_focus=PSF_matrix_focus_norm
+image_de_norm_list=PSF_de_norm_list
+H, W = image_focus.shape
+nZ   = len(Z_UDA_10)
+gamma = 1e-30
 
-image_folder = r"C:\Users\25313\Documents\Zemax\ZOS-API Projects\PythonZOSConnection1\orginal_image"            # 修改为你的图片文件夹路径
-image_files  = [f for f in os.listdir(image_folder)
-                if f.lower().endswith(('.png', '.jpg', '.bmp', '.tif'))]
+def to_t(x):
+    return torch.tensor(np.array(x).astype(np.float32),
+                        dtype=torch.float32, device=device)
 
-print(f"找到 {len(image_files)} 张图片：{image_files}")
-image_path = os.path.join(image_folder, image_files[0])
-image_raw  = load_image(image_path)
-print(f"原始图像尺寸: {image_raw.shape}")
+# Zernike 基底 / 瞳函数
+Z_mat      = to_t(np.stack(Z_UDA_10, axis=-1))
+pupil_mask = to_t((np.abs(Z_UDA_10[0]) > 0).astype(np.float32))
+
+# 图像 → FFT → imgDs (H,W,K)
+I_focus   = torch.fft.fft2(to_t(image_focus)).to(torch.complex64)
+I_de_list = [torch.fft.fft2(to_t(im)).to(torch.complex64)
+             for im in image_de_norm_list]
+imgDs     = torch.stack([I_focus] + I_de_list, dim=2)
+
+# 多样性像差 → wavefront_deltas (H,W,K)
+delta_focus = torch.zeros(H, W, dtype=torch.float32, device=device)
+delta_de_list = [to_t(plot_wavefront_from_zernike(Z_UDA_10, coff).astype(np.float32))
+                 for coff in coff_div_list_10]
+wavefront_deltas = torch.stack([delta_focus] + delta_de_list, dim=2)
+
 # ============================================================
-# 生成卷积图片
+# 包装损失函数为纯 numpy 接口
 # ============================================================
-img_focus,image_upsampled_temp = simulate_imaging(image_raw, PSF_matrix_focus_norm,
-                               d_image=10e-6,
-                               d_psf=10e-6)
-img_de      = []   # 每个离焦量对应的图片
-for i in range(len(PSF_de_norm_list)):
-    img_out_temp,image_upsampled_temp = simulate_imaging(image_raw, PSF_de_norm_list[i],
-                               d_image=10e-6,
-                               d_psf=10e-6)
-    img_de.append(img_out_temp)
+def cost_np(c_np):
+    with torch.no_grad():
+        c_t = torch.tensor(c_np.astype(np.float32), device=device)
+        return cost_pd_image(c_t, Z_mat, pupil_mask,
+                             imgDs, wavefront_deltas,
+                             wvl, d1, d2, Dz, device,
+                             gamma=gamma).item()
+
+# ============================================================
+# 调用诊断函数
+# ============================================================
+# Hessian 耦合分析
+H_mat, corr = compute_hessian(cost_np, F0[:10], eps=1e-3)
+# 灵敏度扫描，确保F0的系数（真值）对于损失函数而言是最小值
+J_curves, scan_vals = sensitivity_scan(
+    PSF_matrix_focus_norm,
+    PSF_de_norm_list,
+    Z_UDA_10,
+    coff_div_list=coff_div_list_10,
+    F0=F0[:10],
+    wvl=wvl, d1=d1,
+    d2=d2, Dz=Dz,
+    scan_range=0.5,    # 每个系数扰动范围 ±0.5
+    scan_steps=41      # 扫描点数
+)
 # ============================================================
 # 相位差算法调用
 # ============================================================
+# 用真实F0验证物体估计
+# obj_est, obj_fft = estimate_object(
+#     F0[:10], Z_UDA_10,
+#     PSF_matrix_focus_norm,   # sum归一后的PSF
+#     PSF_de_norm_list,
+#     coff_div_list=coff_div_list_10,
+#     gamma=1e-30
+# )
+#
+# print(f"obj_fft 幅值均值: {np.abs(obj_fft).mean():.4f}")  # 期望接近1.0
+# print(f"obj_fft 幅值范围: {np.abs(obj_fft).min():.4f} ~ {np.abs(obj_fft).max():.4f}")
+
 c_est, J_hist, wavefront_est = phase_diversity_retrieve(
-    img_focus,
-    img_de,
+    PSF_matrix_focus_norm,
+    PSF_de_norm_list,
     Z_UDA_10,
     coff_div_list = coff_div_list_10,        # 已知离焦量
     wvl=wvl, d1=d1,
     d2=d2, Dz=Dz,
-    gamma=gamma,
+    gamma=1e-30,
     lr=0.001, max_iter=10000,
-    tol=tol,
     optimizer_type='Adam'
 )
-#   用最优系数恢复物体
-obj_est, obj_fft = estimate_object(
-    c_est, Z_UDA_10,
-    PSF_matrix_focus_norm,
-    PSF_de_norm_list,
-    coff_div_list=coff_div_list_10,
-    gamma=gamma
-)
+
 plot_phase_diversity_result(
     PSF_matrix_focus_norm, PSF_de_norm_list,
     wavefront_est, c_est, J_hist, Z_UDA_10,
@@ -472,7 +440,7 @@ plot_phase_diversity_result(
     d2=d2, Dz=Dz,
     wavefront_true = wavefront_matrix_focus,
     c_true = F0[:10],
-    save_path="image_test4/phase_diversity_result_OTFloss.png"
+    save_path="image_test4/phase_diversity_result_gamma=1e-30.png"
 )
 
 
